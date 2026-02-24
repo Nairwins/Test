@@ -1,5 +1,8 @@
+# Virtual environments
 .venv/
+venv/
+.code/
+
+# Python
 __pycache__/
-.env
-.vercel/
 *.pyc
