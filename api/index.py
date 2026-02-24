@@ -1,40 +1,98 @@
-from fastapi import FastAPI, Query
+import io
+import os
+import uuid
+import traceback
+from fastapi import FastAPI, Form, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
-import segno
-from io import BytesIO
+from typing import Optional
 
-app = FastAPI()
+from script.engine import generate_custom_qr, _svg_to_png_bytes
+
+app = FastAPI(
+    title="Pro QR Generator API",
+    description="API wrapper for the custom QR generator."
+)
+
 
 @app.get("/")
-def home():
-    return {"status": "QR Generator is running", "docs": "/docs"}
+async def home():
+    return {"status": "online", "message": "Access /docs for the API interface."}
 
-@app.get("/generate-qr")
+
+@app.post("/generate")
 async def generate_qr(
-    data: str = Query(..., description="The text or URL to encode"),
-    color: str = Query("black", description="Hex or name color for the dark modules"),
-    bg_color: str = Query("white", description="Background color"),
-    scale: int = Query(10, description="Scale of the QR code")
+    data: str                       = Form(...),
+    body_shape: str                 = Form("default"),
+    body_color: str                 = Form("black"),
+    body_gradient_color: Optional[str] = Form(""),
+    body_gradient_type: str         = Form("radial"),
+    innereye_shape: str             = Form("default"),
+    innereye_color: Optional[str]   = Form(""),
+    outereye_shape: str             = Form("default"),
+    outereye_color: Optional[str]   = Form(""),
+    icon_name: Optional[str]        = Form(""),
+    icon_file: Optional[UploadFile] = File(None),
+    size: int                       = Form(10, ge=1, le=50),
+    border: int                     = Form(4, ge=0, le=10),
+    format: str                     = Form("png"),   # "png" or "svg"
 ):
-    """
-    Generates a QR code using Segno and returns it as a PNG.
-    """
-    # Create the QR code
-    qr = segno.make(data)
-    
-    # Create an in-memory buffer
-    buffer = BytesIO()
-    
-    # Save to buffer as PNG
-    # Note: Segno handles the 'scale' and colors natively
-    qr.save(
-        buffer, 
-        kind="png", 
-        dark=color, 
-        light=bg_color, 
-        scale=scale
-    )
-    
-    buffer.seek(0)
-    
-    return StreamingResponse(buffer, media_type="image/png")
+    unique_id       = uuid.uuid4()
+    temp_upload_path = None
+
+    try:
+        # ── Resolve icon ─────────────────────────────────────
+        final_icon_path = icon_name or None
+        if icon_file and icon_file.filename:
+            temp_upload_path = f"/tmp/upload_{unique_id}_{icon_file.filename}"
+            with open(temp_upload_path, "wb") as buf:
+                buf.write(await icon_file.read())
+            final_icon_path = temp_upload_path
+
+        # ── Generate SVG in memory ────────────────────────────
+        # We use a temp path only as a signal; actual bytes come from return value.
+        ext           = "svg" if format.lower() == "svg" else "png"
+        output_path   = f"/tmp/out_{unique_id}.{ext}"
+
+        svg_string = generate_custom_qr(
+            data                = data,
+            output_path         = output_path,
+            body_shape          = body_shape,
+            body_color          = body_color,
+            body_gradient_color = body_gradient_color or None,
+            body_gradient_type  = body_gradient_type,
+            innereye_color      = innereye_color or None,
+            outereye_color      = outereye_color or None,
+            innereye_shape      = innereye_shape,
+            outereye_shape      = outereye_shape,
+            icon_path           = final_icon_path,
+            size                = size,
+            border              = border,
+        )
+
+        # ── Stream response ───────────────────────────────────
+        if format.lower() == "svg":
+            return StreamingResponse(
+                io.BytesIO(svg_string.encode("utf-8")),
+                media_type="image/svg+xml",
+            )
+        else:
+            # _svg_to_png_bytes is already called inside generate_custom_qr and
+            # written to disk; we just read it back (or re-convert from svg_string).
+            # Re-converting from the returned SVG string is cleaner for serverless:
+            png_bytes = _svg_to_png_bytes(svg_string)
+            return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+
+    except Exception as e:
+        print("--- ERROR ---")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Runtime Error: {str(e)}")
+
+    finally:
+        # Clean up any temp files
+        for p in [f"/tmp/out_{unique_id}.png", f"/tmp/out_{unique_id}.svg", temp_upload_path]:
+            if p and os.path.exists(p):
+                os.remove(p)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
