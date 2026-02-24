@@ -6,7 +6,7 @@ from fastapi import FastAPI, Form, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Optional
 
-from script.engine import generate_custom_qr, _svg_to_png_bytes
+from script.engine import generate_custom_qr
 
 app = FastAPI(
     title="Pro QR Generator API",
@@ -21,22 +21,22 @@ async def home():
 
 @app.post("/generate")
 async def generate_qr(
-    data: str                       = Form(...),
-    body_shape: str                 = Form("default"),
-    body_color: str                 = Form("black"),
+    data: str                          = Form(...),
+    body_shape: str                    = Form("default"),
+    body_color: str                    = Form("black"),
     body_gradient_color: Optional[str] = Form(""),
-    body_gradient_type: str         = Form("radial"),
-    innereye_shape: str             = Form("default"),
-    innereye_color: Optional[str]   = Form(""),
-    outereye_shape: str             = Form("default"),
-    outereye_color: Optional[str]   = Form(""),
-    icon_name: Optional[str]        = Form(""),
-    icon_file: Optional[UploadFile] = File(None),
-    size: int                       = Form(10, ge=1, le=50),
-    border: int                     = Form(4, ge=0, le=10),
-    format: str                     = Form("png"),   # "png" or "svg"
+    body_gradient_type: str            = Form("radial"),
+    innereye_shape: str                = Form("default"),
+    innereye_color: Optional[str]      = Form(""),
+    outereye_shape: str                = Form("default"),
+    outereye_color: Optional[str]      = Form(""),
+    icon_name: Optional[str]           = Form(""),
+    icon_file: Optional[UploadFile]    = File(None),
+    size: int                          = Form(10, ge=1, le=50),
+    border: int                        = Form(4, ge=0, le=10),
+    format: str                        = Form("png"),  # "png" or "svg"
 ):
-    unique_id       = uuid.uuid4()
+    unique_id        = uuid.uuid4()
     temp_upload_path = None
 
     try:
@@ -48,12 +48,11 @@ async def generate_qr(
                 buf.write(await icon_file.read())
             final_icon_path = temp_upload_path
 
-        # ── Generate SVG in memory ────────────────────────────
-        # We use a temp path only as a signal; actual bytes come from return value.
-        ext           = "svg" if format.lower() == "svg" else "png"
-        output_path   = f"/tmp/out_{unique_id}.{ext}"
+        # ── Generate ─────────────────────────────────────────
+        ext         = "svg" if format.lower() == "svg" else "png"
+        output_path = f"/tmp/out_{unique_id}.{ext}"
 
-        svg_string = generate_custom_qr(
+        result = generate_custom_qr(
             data                = data,
             output_path         = output_path,
             body_shape          = body_shape,
@@ -71,16 +70,17 @@ async def generate_qr(
 
         # ── Stream response ───────────────────────────────────
         if format.lower() == "svg":
+            # result is an SVG string
             return StreamingResponse(
-                io.BytesIO(svg_string.encode("utf-8")),
+                io.BytesIO(result.encode("utf-8")),
                 media_type="image/svg+xml",
             )
         else:
-            # _svg_to_png_bytes is already called inside generate_custom_qr and
-            # written to disk; we just read it back (or re-convert from svg_string).
-            # Re-converting from the returned SVG string is cleaner for serverless:
-            png_bytes = _svg_to_png_bytes(svg_string)
-            return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+            # result is a PIL Image — convert to PNG bytes in memory
+            buf = io.BytesIO()
+            result.save(buf, "PNG")
+            buf.seek(0)
+            return StreamingResponse(buf, media_type="image/png")
 
     except Exception as e:
         print("--- ERROR ---")
@@ -88,10 +88,10 @@ async def generate_qr(
         raise HTTPException(status_code=500, detail=f"Runtime Error: {str(e)}")
 
     finally:
-        # Clean up any temp files
         for p in [f"/tmp/out_{unique_id}.png", f"/tmp/out_{unique_id}.svg", temp_upload_path]:
             if p and os.path.exists(p):
                 os.remove(p)
+
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,6 +1,6 @@
 # ============================================================
 #  script/code.py  –  Core QR generation engine (Vercel-safe)
-#  cairosvg replaced with svglib + reportlab (pure Python)
+#  PNG rendered directly with Pillow — zero system dependencies
 # ============================================================
 
 import os
@@ -8,28 +8,16 @@ import re
 import base64
 import mimetypes
 import math
-import tempfile
 from io import BytesIO
 
 import segno
-from svglib.svglib import svg2rlg
-from reportlab.graphics import renderPM
+from PIL import Image, ImageDraw
 
 from script.assets import (
     BODY_PRESETS,
     resolve_color, resolve_inner, resolve_outer,
     resolve_icon, resolve_gradient, resolve_body_shape,
 )
-
-GRADIENT_TYPES_MAP = {
-    "left_to_right":  ("0%",   "0%",   "100%", "0%"),
-    "right_to_left":  ("100%", "0%",   "0%",   "0%"),
-    "top_to_bottom":  ("0%",   "0%",   "0%",   "100%"),
-    "bottom_to_top":  ("0%",   "100%", "0%",   "0%"),
-    "diagonal_tl_br": ("0%",   "0%",   "100%", "100%"),
-    "diagonal_tr_bl": ("100%", "0%",   "0%",   "100%"),
-    "radial":          None,
-}
 
 
 # ────────────────────────────────────────────────────────────
@@ -76,24 +64,8 @@ def _module_colour(col, row, matrix_size, border, size,
 
 
 # ────────────────────────────────────────────────────────────
-#  SVG helpers  (no cairosvg)
+#  SVG helpers  (SVG output only)
 # ────────────────────────────────────────────────────────────
-
-def _svg_to_png_bytes(svg_string: str) -> bytes:
-    """Convert an SVG string to PNG bytes using svglib + reportlab."""
-    with tempfile.NamedTemporaryFile(suffix=".svg", delete=False,
-                                     mode="w", encoding="utf-8") as f:
-        f.write(svg_string)
-        tmp_path = f.name
-    try:
-        drawing = svg2rlg(tmp_path)
-        buf = BytesIO()
-        renderPM.drawToFile(drawing, buf, fmt="PNG")
-        buf.seek(0)
-        return buf.read()
-    finally:
-        os.unlink(tmp_path)
-
 
 def _load_svg(path, strip_fill=True):
     if not path or not os.path.exists(path) or not path.lower().endswith(".svg"):
@@ -122,26 +94,85 @@ def _svg_size(path):
         return float(wm.group(1)), float(hm.group(1))
     return 100, 100
 
-def _icon_base64(path, target_width):
-    """Return a base64 data-URI for the icon. SVG icons are rasterised via svglib."""
+def _icon_base64_for_svg(path, target_width):
+    """For SVG output only — embeds icon as base64."""
     if not path or not os.path.exists(path):
         return None
-
     if path.lower().endswith(".svg"):
-        # Build a tiny wrapper SVG sized to target_width so svglib scales it correctly
-        inner = _load_svg(path, strip_fill=False)
-        iw, ih = _svg_size(path)
-        wrapper = (
-            f'<svg xmlns="http://www.w3.org/2000/svg" '
-            f'width="{target_width * 2}" height="{target_width * 2}" '
-            f'viewBox="0 0 {iw} {ih}">{inner}</svg>'
-        )
-        png_bytes = _svg_to_png_bytes(wrapper)
-        return "data:image/png;base64," + base64.b64encode(png_bytes).decode()
-
+        # For SVG output, just embed the SVG as-is via base64
+        with open(path, "rb") as f:
+            return "data:image/svg+xml;base64," + base64.b64encode(f.read()).decode()
     mime, _ = mimetypes.guess_type(path)
     with open(path, "rb") as f:
         return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
+
+
+# ────────────────────────────────────────────────────────────
+#  Direct Pillow PNG renderer  (no cairo, no svglib)
+# ────────────────────────────────────────────────────────────
+
+def _draw_png(
+    matrix, matrix_size, total_px, size, border,
+    body_color, body_gradient_color, body_gradient_type,
+    innereye_color, outereye_color,
+    icon_file, m_start, m_end,
+):
+    img  = Image.new("RGB", (total_px, total_px), "white")
+    draw = ImageDraw.Draw(img)
+
+    def is_finder(col, row):
+        for fx, fy in [(0, 0), (matrix_size - 7, 0), (0, matrix_size - 7)]:
+            if fx <= col < fx + 7 and fy <= row < fy + 7:
+                return True
+        return False
+
+    # Body modules
+    for row in range(matrix_size):
+        for col in range(matrix_size):
+            if not matrix[row][col]:
+                continue
+            if is_finder(col, row):
+                continue
+            if m_start <= col < m_end and m_start <= row < m_end:
+                continue
+            color = _module_colour(
+                col, row, matrix_size, border, size,
+                body_color, body_gradient_color, body_gradient_type,
+            )
+            px = (col + border) * size
+            py = (row + border) * size
+            draw.rectangle([px, py, px + size - 1, py + size - 1], fill=color)
+
+    # Finder eyes
+    EYE = 7 * size
+    for fx, fy in [(0, 0), (matrix_size - 7, 0), (0, matrix_size - 7)]:
+        px = (fx + border) * size
+        py = (fy + border) * size
+        # Outer ring
+        draw.rectangle([px, py, px + EYE - 1, py + EYE - 1], fill=outereye_color)
+        draw.rectangle([px + size, py + size,
+                         px + EYE - size - 1, py + EYE - size - 1], fill="white")
+        # Inner square
+        ix = px + 2 * size
+        iy = py + 2 * size
+        inner = 3 * size
+        draw.rectangle([ix, iy, ix + inner - 1, iy + inner - 1], fill=innereye_color)
+
+    # Icon
+    if icon_file and os.path.exists(icon_file) and m_start >= 0:
+        dim = (m_end - m_start) * size
+        pos = (m_start + border) * size
+        try:
+            icon_img = Image.open(icon_file).convert("RGBA")
+            icon_img = icon_img.resize((dim, dim), Image.LANCZOS)
+            # White background behind icon
+            bg = Image.new("RGB", (dim, dim), "white")
+            bg.paste(icon_img, mask=icon_img.split()[3] if icon_img.mode == "RGBA" else None)
+            img.paste(bg, (pos, pos))
+        except Exception as e:
+            print(f"Icon paste failed: {e}")
+
+    return img
 
 
 # ────────────────────────────────────────────────────────────
@@ -164,11 +195,6 @@ def generate_custom_qr(
     size                    = 10,
     border                  = 4,
 ):
-    """
-    Generate a custom QR code and save to output_path (.svg or .png).
-    Works on Vercel / any serverless environment (no cairosvg).
-    """
-
     # ── Resolve friendly values ──────────────────────────────
     body_color           = resolve_color(body_color)           or "#000000"
     body_gradient_color  = resolve_color(body_gradient_color)
@@ -196,14 +222,31 @@ def generate_custom_qr(
     else:
         m_start = m_end = -1
 
-    # ── Helpers ──────────────────────────────────────────────
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    ext = os.path.splitext(output_path)[1].lower()
+
+    # ── PNG: draw directly with Pillow ───────────────────────
+    if ext != ".svg":
+        img = _draw_png(
+            matrix, matrix_size, total_px, size, border,
+            body_color, body_gradient_color, body_gradient_type,
+            innereye_color, outereye_color,
+            icon_file, m_start, m_end,
+        )
+        img.save(output_path, "PNG")
+        print(f"✅  PNG → {output_path}")
+        return img  # return PIL Image for in-memory use
+
+    # ── SVG: build markup ────────────────────────────────────
     def is_finder(col, row):
         for fx, fy in [(0, 0), (matrix_size - 7, 0), (0, matrix_size - 7)]:
             if fx <= col < fx + 7 and fy <= row < fy + 7:
                 return True
         return False
 
-    # ── Body shape ───────────────────────────────────────────
     if body_shape_key in BODY_PRESETS:
         body_svg = BODY_PRESETS[body_shape_key]
         body_w = body_h = 10
@@ -219,30 +262,21 @@ def generate_custom_qr(
     inner_svg        = _load_svg(innereye_shape_path, strip_fill=False)
     inner_w, inner_h = _svg_size(innereye_shape_path)
 
-    # ── Build SVG ────────────────────────────────────────────
     lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
         f'width="{total_px}" height="{total_px}" viewBox="0 0 {total_px} {total_px}">',
         f'<rect width="{total_px}" height="{total_px}" fill="white"/>',
     ]
 
-    # Body modules
     for row in range(matrix_size):
         for col in range(matrix_size):
-            if not matrix[row][col]:
-                continue
-            if is_finder(col, row):
-                continue
-            if m_start <= col < m_end and m_start <= row < m_end:
-                continue
-
+            if not matrix[row][col]: continue
+            if is_finder(col, row):  continue
+            if m_start <= col < m_end and m_start <= row < m_end: continue
             px    = (col + border) * size
             py    = (row + border) * size
-            color = _module_colour(
-                col, row, matrix_size, border, size,
-                body_color, body_gradient_color, body_gradient_type,
-            )
-
+            color = _module_colour(col, row, matrix_size, border, size,
+                                   body_color, body_gradient_color, body_gradient_type)
             if body_svg:
                 sx, sy = size / body_w, size / body_h
                 lines.append(
@@ -254,20 +288,16 @@ def generate_custom_qr(
                     f'<rect x="{px}" y="{py}" width="{size}" height="{size}" fill="{color}"/>'
                 )
 
-    # Finder eyes
     EYE_PX = 7 * size
-    for fx, fy, angle in [(0, 0, 0), (matrix_size - 7, 0, 90), (0, matrix_size - 7, -90)]:
+    for fx, fy, angle in [(0, 0, 0), (matrix_size-7, 0, 90), (0, matrix_size-7, -90)]:
         px = (fx + border) * size
         py = (fy + border) * size
         cx = px + EYE_PX / 2
         cy = py + EYE_PX / 2
-
         if outer_svg:
-            tf = (
-                f"translate({cx},{cy}) rotate({angle}) "
-                f"translate({-EYE_PX/2},{-EYE_PX/2}) "
-                f"scale({EYE_PX/outer_w},{EYE_PX/outer_h})"
-            )
+            tf = (f"translate({cx},{cy}) rotate({angle}) "
+                  f"translate({-EYE_PX/2},{-EYE_PX/2}) "
+                  f"scale({EYE_PX/outer_w},{EYE_PX/outer_h})")
             lines.append(
                 f'<g transform="{tf}" style="color:{outereye_color};" fill="currentColor">'
                 f"{outer_svg}</g>"
@@ -278,8 +308,7 @@ def generate_custom_qr(
                 f'M{px+size},{py+size} v{5*size} h{5*size} v-{5*size} z" '
                 f'fill="{outereye_color}"/>'
             )
-
-        ix, iy   = px + 2 * size, py + 2 * size
+        ix, iy   = px + 2*size, py + 2*size
         inner_px = 3 * size
         if inner_svg:
             tf_i = f"translate({ix},{iy}) scale({inner_px/inner_w},{inner_px/inner_h})"
@@ -293,36 +322,17 @@ def generate_custom_qr(
                 f'fill="{innereye_color}"/>'
             )
 
-    # Icon
     if icon_file and os.path.exists(icon_file) and m_start >= 0:
         dim = (m_end - m_start) * size
         pos = (m_start + border) * size
-        img = _icon_base64(icon_file, dim)
-        if img:
-            lines.append(
-                f'<rect x="{pos}" y="{pos}" width="{dim}" height="{dim}" fill="white"/>'
-            )
-            lines.append(
-                f'<image xlink:href="{img}" x="{pos}" y="{pos}" width="{dim}" height="{dim}"/>'
-            )
+        img_data = _icon_base64_for_svg(icon_file, dim)
+        if img_data:
+            lines.append(f'<rect x="{pos}" y="{pos}" width="{dim}" height="{dim}" fill="white"/>')
+            lines.append(f'<image xlink:href="{img_data}" x="{pos}" y="{pos}" width="{dim}" height="{dim}"/>')
 
     lines.append("</svg>")
     full_svg = "\n".join(lines)
-
-    # ── Save ─────────────────────────────────────────────────
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    ext = os.path.splitext(output_path)[1].lower()
-    if ext == ".svg":
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(full_svg)
-        print(f"✅  SVG → {output_path}")
-    else:
-        png_bytes = _svg_to_png_bytes(full_svg)
-        with open(output_path, "wb") as f:
-            f.write(png_bytes)
-        print(f"✅  PNG → {output_path}")
-
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(full_svg)
+    print(f"✅  SVG → {output_path}")
     return full_svg

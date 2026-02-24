@@ -2,6 +2,4 @@ segno
 fastapi
 uvicorn[standard]
 python-multipart
-svglib
-reportlab
 Pillow
